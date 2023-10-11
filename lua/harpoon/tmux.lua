@@ -46,28 +46,61 @@ local function create_terminal()
     return window_id
 end
 
--- Checks if the tmux window with the given window id exists
-local function terminal_exists(window_id)
-    log.trace("_terminal_exists(): Window:", window_id)
-
-    local exists = false
-
-    local window_list, _, _ = utils.get_os_command_output({
+-- Tries to find the given pane, returning a switch-client target string if found, and nil if not
+local function terminal_location(pane_id)
+    log.trace("_terminal_location(): Window:", window_id)
+    local locations, _, _ = utils.get_os_command_output({
         "tmux",
-        "list-windows",
+        "list-panes",
+        "-s",
+        "-f", "#{==:#{pane_id}," .. pane_id .. "}",
+        "-F", "#{session_name}:#{window_id}.#{pane_id}"
     }, vim.loop.cwd())
-
-    -- This has to be done this way because tmux has-session does not give
-    -- updated results
-    for _, line in pairs(window_list) do
-        local window_info = utils.split_string(line, "@")[2]
-
-        if string.find(window_info, string.sub(window_id, 2)) then
-            exists = true
-        end
+    if #locations < 1 then
+        return nil
+    else
+        return locations[1]
     end
+end
 
-    return exists
+local window_handle_base = {}
+function window_handle_base:new(opts)
+    opts = opts or {}
+    setmetatable(opts, self)
+    self.__index = self
+    return opts
+end
+function window_handle_base:target_info()
+    local locations, _, _ = utils.get_os_command_output({
+        "tmux",
+        "list-panes",
+        "-s",
+        "-f", "#{==:#{pane_id}," .. self.window_id .. "}",
+        "-F", "#{session_name}:#{window_id}.#{pane_id}"
+    }, vim.loop.cwd())
+    if #locations < 1 then
+        return nil
+    else
+        return locations[1]
+    end
+end
+function window_handle_base:make_current()
+    local _, ret, stderr = utils.get_os_command_output({
+        "tmux",
+        "switch-client",
+        "-t", self:target_info()
+    })
+    if ret ~= 0 then
+        error("Failed to go to terminal: " .. stderr[1])
+    end
+end
+function window_handle_base:exists()
+    local _, ret, _ = utils.get_os_command_output({
+        "tmux",
+        "has-session",
+        "-t", self.window_id,
+    }, vim.loop.cwd())
+    return ret == 0
 end
 
 local function find_terminal(args)
@@ -76,10 +109,20 @@ local function find_terminal(args)
     if type(args) == "string" then
         -- assume args is a valid tmux target identifier
         -- if invalid, the error returned by tmux will be thrown
-        return {
+        return window_handle_base:new({
             window_id = args,
             pane = true,
-        }
+            make_current = function (self)
+                local _, ret, stderr = utils.get_os_command_output({
+                    "tmux",
+                    "select-pane",
+                    "-t", self.window_id,
+                })
+                if ret ~= 0 then
+                    error("Failed to go to terminal: " .. stderr[1])
+                end
+            end
+        })
     end
 
     if type(args) == "number" then
@@ -87,13 +130,8 @@ local function find_terminal(args)
     end
 
     local window_handle = tmux_windows[args.idx]
-    local window_exists
 
-    if window_handle then
-        window_exists = terminal_exists(window_handle.window_id)
-    end
-
-    if not window_handle or not window_exists then
+    if not window_handle or not window_handle:exists() then
         local window_id = create_terminal()
 
         if window_id == nil then
@@ -101,13 +139,12 @@ local function find_terminal(args)
             return
         end
 
-        window_handle = {
+        window_handle = window_handle_base:new({
             window_id = "%" .. window_id,
-        }
+        })
 
         tmux_windows[args.idx] = window_handle
     end
-
     return window_handle
 end
 
@@ -124,17 +161,7 @@ end
 function M.gotoTerminal(idx)
     log.trace("tmux: gotoTerminal(): Window:", idx)
     local window_handle = find_terminal(idx)
-
-    local _, ret, stderr = utils.get_os_command_output({
-        "tmux",
-        window_handle.pane and "select-pane" or "select-window",
-        "-t",
-        window_handle.window_id,
-    }, vim.loop.cwd())
-
-    if ret ~= 0 then
-        error("Failed to go to terminal." .. stderr[1])
-    end
+    window_handle:make_current()
 end
 
 function M.sendCommand(idx, cmd, ...)
