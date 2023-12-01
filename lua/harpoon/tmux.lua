@@ -4,8 +4,6 @@ local global_config = harpoon.get_global_settings()
 local utils = require("harpoon.utils")
 
 local M = {}
-local tmux_windows = {}
-
 if global_config.tmux_autoclose_windows then
     local harpoon_tmux_group = vim.api.nvim_create_augroup(
         "HARPOON_TMUX",
@@ -20,22 +18,43 @@ if global_config.tmux_autoclose_windows then
     })
 end
 
-local function create_terminal()
+local default_options = {}
+local tmux_options = default_options
+
+local function create_terminal(args)
     log.trace("tmux: _create_terminal())")
 
     local window_id
+    local real_window_id
 
     -- Create a new tmux window and store the window id
-    local out, ret, _ = utils.get_os_command_output({
+    local tmux_command = {
         "tmux",
         "new-window",
         "-P",
         "-F",
-        "#{pane_id}",
-    }, vim.loop.cwd())
+        "#{pane_id}:#{window_id}",
+    }
+    local window_name_opt = nil
+    if tmux_options.window_name then
+        if type(tmux_options.window_name) == 'string' then
+            table.insert(tmux_command, '-n')
+            table.insert(tmux_command, tmux_options.window_name)
+        else
+            window_name_opt = tmux_options.window_name
+        end
+    end
+    local out, ret, _ = utils.get_os_command_output(
+        tmux_command,
+        vim.loop.cwd()
+    )
 
     if ret == 0 then
-        window_id = out[1]:sub(2)
+        -- local full_id = string.gmatch(out[1], ':')
+        local full_id = utils.split_string(out[1], ':')
+        -- this is really the pane id
+        window_id = full_id[1]:sub(2)
+        real_window_id = full_id[2]
     end
 
     if window_id == nil then
@@ -43,10 +62,21 @@ local function create_terminal()
         return nil
     end
 
+    if type(window_name_opt) == 'function' then
+        local _, ret, stderr = utils.get_os_command_output({
+            "tmux",
+            "rename-window",
+            "-t",
+            real_window_id,
+            window_name_opt(args, window_id, real_window_id),
+        }, vim.loop.cwd())
+    end
+
     return window_id
 end
 
--- Tries to find the given pane, returning a switch-client target string if found, and nil if not
+-- Tries to find the given pane, returning a switch-client target string if
+-- found, returning nil if not
 local function terminal_location(pane_id)
     log.trace("_terminal_location(): Window:", window_id)
     local locations, _, _ = utils.get_os_command_output({
@@ -102,37 +132,53 @@ function window_handle_base:exists()
     }, vim.loop.cwd())
     return ret == 0
 end
+function window_handle_base:kill_window(opts)
+    opts = opts or {}
+    setmetatable(opts, {
+        __index = {
+            command = "kill-pane",
+        }
+    })
+    local _, ret, stderr = utils.get_os_command_output({
+        "tmux",
+        opts.command,
+        "-t",
+        self.window_id
+    }, vim.loop.cwd())
+    if ret ~= 0 and self:exists() then
+        error("Failed to kill running window: " .. stderr[1])
+    end
+end
+function window_handle_base:send_keys(cmd, ...)
+    local _, ret, stderr = utils.get_os_command_output({
+        "tmux",
+        "send-keys",
+        "-t",
+        self.window_id,
+        string.format(cmd, ...)
+    })
+    if ret ~= 0 then
+        error('error sending command to terminal at ' .. self.window_id .. ': ' .. stderr[1])
+    end
+end
+
+local tmux_windows = setmetatable({}, {
+    __index = function(table, key)
+        if type(key) == 'string' and string.len(key) > 0 then
+            return window_handle_base:new({
+                window_id = key,
+            })
+        end
+    end,
+})
 
 local function find_terminal(args)
     log.trace("tmux: _find_terminal(): Window:", args)
 
-    if type(args) == "string" then
-        -- assume args is a valid tmux target identifier
-        -- if invalid, the error returned by tmux will be thrown
-        return window_handle_base:new({
-            window_id = args,
-            pane = true,
-            make_current = function (self)
-                local _, ret, stderr = utils.get_os_command_output({
-                    "tmux",
-                    "select-pane",
-                    "-t", self.window_id,
-                })
-                if ret ~= 0 then
-                    error("Failed to go to terminal: " .. stderr[1])
-                end
-            end
-        })
-    end
+    local window_handle = tmux_windows[args]
 
-    if type(args) == "number" then
-        args = { idx = args }
-    end
-
-    local window_handle = tmux_windows[args.idx]
-
-    if not window_handle or not window_handle:exists() then
-        local window_id = create_terminal()
+    if type(args) == 'number' and (not window_handle or not window_handle:exists()) then
+        local window_id = create_terminal(args)
 
         if window_id == nil then
             error("Failed to find and create tmux window.")
@@ -143,7 +189,7 @@ local function find_terminal(args)
             window_id = "%" .. window_id,
         })
 
-        tmux_windows[args.idx] = window_handle
+        tmux_windows[args] = window_handle
     end
     return window_handle
 end
@@ -178,18 +224,7 @@ function M.sendCommand(idx, cmd, ...)
 
     if cmd then
         log.debug("sendCommand:", cmd)
-
-        local _, ret, stderr = utils.get_os_command_output({
-            "tmux",
-            "send-keys",
-            "-t",
-            window_handle.window_id,
-            string.format(cmd, ...),
-        }, vim.loop.cwd())
-
-        if ret ~= 0 then
-            error("Failed to send command. " .. stderr[1])
-        end
+        window_handle:send_keys(cmd, ...)
     end
 end
 
@@ -198,12 +233,7 @@ function M.clear_all()
 
     for _, window in pairs(tmux_windows) do
         -- Delete the current tmux window
-        utils.get_os_command_output({
-            "tmux",
-            "kill-window",
-            "-t",
-            window.window_id,
-        }, vim.loop.cwd())
+        window:kill_window()
     end
 
     tmux_windows = {}
@@ -254,6 +284,12 @@ function M.set_cmd_list(new_list)
         harpoon.get_term_config().cmds[k] = v
     end
     M.emit_changed()
+end
+
+function M.setup(opts)
+    tmux_options = setmetatable(opts, {
+        __index = default_options,
+    })
 end
 
 return M
